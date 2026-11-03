@@ -1,7 +1,7 @@
 {
   "name": "as-installed",
   "description": "Writes and fixes code against the library versions your project actually has installed: reads the real types, source and changelog, then checks every import and name exists and isn't deprecated.",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "license": "MIT",
   "author": {
     "name": "Rashid Mahmood"

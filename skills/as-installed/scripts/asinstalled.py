@@ -765,6 +765,9 @@ def cmd_find(args):
                 doc = before[before.rfind("/**"):] if "/**" in before and "*/" in before[before.rfind("/**"):] and \
                     before[before.rfind("*/") + 2:].strip() == "" else ""
                 after = text[m.end():m.end() + 1200]
+                # only this definition's own body: stop at the next decorator or definition
+                nxt = re.search(r"\n[ \t]*(?:@|def |async def |class )", after)
+                after = after[:nxt.start()] if nxt else after
                 pydep = re.search(r"(?i)(?:\.\. deprecated::|warnings\.warn\([^)]*Deprecat|@deprecated|DeprecationWarning)", after[:800]) \
                     if f.endswith((".py", ".pyi")) else None
                 above = text[max(0, m.start() - 300):m.start()]

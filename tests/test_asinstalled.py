@@ -292,6 +292,19 @@ class WhereFindTest(TempRepo):
         res, _ = run(["find", "fakepy", "send", "--root", self.root])
         self.assertTrue(any(h["file"].endswith("client.py") for h in res["hits"]))
 
+    def test_find_python_deprecation_does_not_leak_to_previous_def(self):
+        # The decorator belongs to put(); set(), defined just above it, is not deprecated.
+        self.site({"kv/__init__.py": (
+            "from warnings import deprecated\n\nclass Store:\n"
+            "    def set(self, k, v):\n        '''Store v.'''\n        self.d[k] = v\n\n"
+            "    @deprecated('use set()')\n    def put(self, k, v):\n        self.set(k, v)\n"),
+            "kv-1.0.dist-info/METADATA": "Metadata-Version: 2.1\nName: kv\nVersion: 1.0\n"})
+        write(self.root, {"requirements.txt": "kv\n"})
+        res, _ = run(["find", "kv", "set", "--root", self.root])
+        self.assertEqual([h["deprecated"] for h in res["hits"] if h["text"].startswith("def set")], [None])
+        res, _ = run(["find", "kv", "put", "--root", self.root])
+        self.assertTrue([h for h in res["hits"] if h["text"].startswith("def put") and h["deprecated"]])
+
 
 if __name__ == "__main__":
     unittest.main()

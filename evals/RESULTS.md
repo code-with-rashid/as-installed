@@ -1,6 +1,6 @@
 # Eval results
 
-Run on 2026-11-03 (v0.1.0) on Windows 11, Python 3.14, Node 24, npm 11.
+Run on 2026-11-03 (v0.1.0; the `find` fix in 0.1.1 came from the Haiku E3 run) on Windows 11, Python 3.14, Node 24, npm 11.
 Each eval ran in a fresh agent session that saw only the skill's name,
 description and SKILL.md path (the skill folder was read-only). Grading was
 done from the filesystem: git status and diff, running the code and tests,
@@ -50,12 +50,12 @@ name an error, a library version or an SDK triggered every time.
 
 ## Unit tests
 
-`python -m unittest discover -s tests`: 17 tests, all passing. They cover range
+`python -m unittest discover -s tests`: 18 tests, all passing. They cover range
 checks; npm, pnpm, yarn, uv, requirements, Go and Cargo version resolution;
 `.d.ts` export resolution (star and list re-exports, subpath exports, `@types`
 fallback, `@deprecated`); JS/TS import parsing; Python import, attribute,
 lazy-module and deprecation checks; `where` and `find` for both ecosystems; and
-tsconfig path aliases.
+tsconfig path aliases, and (0.1.1) a decorator on the next definition not leaking into `find` results.
 
 Real-package smoke test: on `ai@7.0.162` and `mcp` 2.3.0, `check` flagged the
 removed `mcp.server.fastmcp` import and made-up exports, and `find` marked

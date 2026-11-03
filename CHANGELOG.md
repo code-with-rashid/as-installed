@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.1.1 — 2026-11-03
+
+- `find` (Python): a `@deprecated` decorator or deprecation warning on the next
+  definition no longer marks the previous one deprecated (found in the Haiku
+  E3 eval: `Store.set` was flagged because `Store.put` below it is deprecated).
+
 ## 0.1.0 — 2026-11-03
 
 First release.

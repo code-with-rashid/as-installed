@@ -17,7 +17,7 @@ description: >-
 license: MIT
 compatibility: Requires Python 3.8+. Node.js is used when present to read runtime exports of untyped npm packages.
 metadata:
-  version: "0.1.0"
+  version: "0.1.1"
   author: Rashid Mahmood
 ---
 
