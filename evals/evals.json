@@ -1,0 +1,99 @@
+{
+  "skill": "as-installed",
+  "how_to_run": "Build each scenario with the command given, copy skills/as-installed to a read-only folder, and run each prompt in a fresh agent session whose only context is the skill's name, description and SKILL.md path. Grade from the filesystem (git status/diff, running the code and tests, installed versions), not from the agent's report, except where an expectation is about the report.",
+  "evals": [
+    {
+      "id": "E1-tidewater-new-code",
+      "scenario": "python evals/scenarios/make_tidewater.py DEST",
+      "prompt": "Add src/orders.js exporting an async getOrders(url) that returns the rows of the orders table using our database client, plus a test in test/orders.test.js. docs/database.md shows how we use the DB.",
+      "should_trigger": true,
+      "expectations": [
+        "src/orders.js uses openPool (not createPool) and pool.run (not the deprecated pool.query)",
+        "getOrders returns the rows array (run() resolves to { rows, rowCount })",
+        "npm test passes",
+        "src/users.js and docs/database.md are not modified",
+        "the report says docs/database.md shows the old 2.x API and src/users.js uses deprecated pool.query()"
+      ]
+    },
+    {
+      "id": "E2-tidewater-stale-install",
+      "scenario": "python evals/scenarios/make_tidewater.py DEST --stale",
+      "prompt": "Add src/orders.js exporting an async getOrders(url) that returns the rows of the orders table using our database client, plus a test in test/orders.test.js.",
+      "should_trigger": true,
+      "expectations": [
+        "the agent notices node_modules holds tidewater 2.4.0 while the lockfile pins 3.1.0",
+        "it reinstalls from the lockfile (npm ci / npm install) so node_modules/tidewater is 3.1.0 afterwards, without changing package.json or the lock pin",
+        "src/orders.js uses the 3.x API (openPool, run)",
+        "npm test passes",
+        "the report mentions the stale install"
+      ]
+    },
+    {
+      "id": "E3-quill-importerror",
+      "scenario": "python evals/scenarios/make_quill.py DEST quill",
+      "prompt": "`python app.py bob` crashes with an ImportError since we upgraded. Fix it.",
+      "should_trigger": true,
+      "expectations": [
+        "app.py imports open_store (not connect)",
+        "it uses Store.get (fetch was removed) and Store.set (put is deprecated)",
+        "`.venv/Scripts/python app.py bob` (or bin/python) runs and prints a list ending with 'bob'",
+        "quillstore is still 2.0.1 and nothing under .venv was edited",
+        "running app.py emits no DeprecationWarning"
+      ]
+    },
+    {
+      "id": "E4-mcp2-real",
+      "scenario": "python evals/scenarios/make_quill.py DEST mcp   (needs network: installs mcp 2.x from PyPI)",
+      "prompt": "Add server.py: an MCP server called `calc` with one tool, add(a: int, b: int) -> int, that runs over stdio with `python server.py`.",
+      "should_trigger": true,
+      "expectations": [
+        "server.py imports from an API that exists in the installed mcp 2.x (e.g. mcp.server.mcpserver.MCPServer), not mcp.server.fastmcp",
+        "asinstalled.py check server.py reports no problems",
+        "importing server.py with the venv interpreter works",
+        "an MCP client over stdio can list the add tool and add(2, 3) returns 5"
+      ]
+    },
+    {
+      "id": "N1-stdlib-only",
+      "scenario": "python evals/scenarios/make_tidewater.py DEST",
+      "prompt": "Add a slugify(text) helper to src/slug.js (lowercase, spaces and punctuation to single hyphens, no leading/trailing hyphens) with a node:test test.",
+      "should_trigger": false,
+      "expectations": ["the skill is not needed: no third-party package is involved", "the helper works and its test passes"]
+    },
+    {
+      "id": "N2-bump-version",
+      "prompt": "Bump tidewater to ^4.0.0 in package.json and regenerate the lockfile.",
+      "should_trigger": false,
+      "expectations": ["choosing or bumping dependency versions is out of scope for this skill"]
+    },
+    {
+      "id": "N3-agents-md-audit",
+      "prompt": "Is our AGENTS.md still accurate? Check the commands it lists.",
+      "should_trigger": false,
+      "expectations": ["this is an instruction-file audit, not library API usage"]
+    }
+  ],
+  "triggering": {
+    "method": "Router test: a fresh model is shown the descriptions of as-installed and 11 neighbouring skills and asked which skill (if any) it would load for each prompt.",
+    "should_trigger": [
+      "Add an MCP server with an add tool to this Python project.",
+      "Use the Vercel AI SDK to stream the chat response in app/api/chat/route.ts.",
+      "Getting `ImportError: cannot import name 'BaseSettings' from 'pydantic'`. Fix it.",
+      "TypeError: client.createPool is not a function after npm update. Help.",
+      "We upgraded to Next 16 yesterday; update the middleware to the new API.",
+      "Check that the code in this PR only calls functions that exist in our installed library versions.",
+      "Write a script that uploads files to S3 with the AWS SDK v3 we have installed.",
+      "tsc says Module '\"zod\"' has no exported member 'ZodSchema'. Fix the import."
+    ],
+    "should_not_trigger": [
+      "Write a pure Python function that checks if a string is a palindrome.",
+      "Rename the variable `cnt` to `count` across utils.py.",
+      "Upgrade React from 18 to 19 in package.json and regenerate the lockfile.",
+      "Is our AGENTS.md still accurate? Check the commands it lists.",
+      "This test fails randomly in CI. Figure out why.",
+      "Explain how the request pipeline in this repo works.",
+      "Write a regex that matches ISO-8601 dates.",
+      "Review this diff for SQL injection."
+    ]
+  }
+}

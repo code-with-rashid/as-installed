@@ -1,0 +1,8 @@
+{
+  "name": "as-installed",
+  "description": "Installed-version API grounding as a portable Agent Skill: code against what's in your lockfile, verified import by import.",
+  "owner": { "name": "Rashid Mahmood" },
+  "plugins": [
+    { "name": "as-installed", "source": "./skills/as-installed" }
+  ]
+}
