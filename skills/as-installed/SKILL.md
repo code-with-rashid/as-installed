@@ -17,7 +17,7 @@ description: >-
 license: MIT
 compatibility: Requires Python 3.8+. Node.js is used when present to read runtime exports of untyped npm packages.
 metadata:
-  version: "0.1.1"
+  version: "0.2.0"
   author: Rashid Mahmood
 ---
 
@@ -82,13 +82,17 @@ lookups. Run it with the project root as the working directory (or pass
 4. **Verify.** `python scripts/asinstalled.py check <changed files or dirs>`.
    It checks every third-party import, imported name, and module/namespace
    member access (`pkg.fn`, `ns.member`, `Class.method`) against the installed
-   packages, and flags deprecated ones. Exit code 1 means something is missing.
+   packages, and flags deprecated ones. It also checks members used on what an
+   imported function or class returns (`const r = await fn(...); r.x`,
+   `fn(...).x`, `new Client().x`), one level deep, against the declared return
+   type. Exit code 1 means something is missing.
    Fix every `missing-package`, `missing-module`, `missing-name` and
    `deprecated` finding, then run it again until clean. Treat `unverified` as
-   "read the source yourself". Then run the project's own typecheck, build or
-   tests if it has them (`tsc --noEmit`, `mypy`, `go build`, `cargo check`).
-   `check` can't follow methods on objects returned by calls
-   (`client.chat.create(...)`); confirm those with `find`.
+   "read the source yourself": run `find` on that member. Deeper chains
+   (`client.chat.completions.create`) and values passed between functions
+   aren't followed; confirm the calls you wrote there with `find` too. Then
+   run the project's own typecheck, build or tests if it has them
+   (`tsc --noEmit`, `mypy`, `go build`, `cargo check`).
 5. **Report** briefly: packages and installed versions you coded against,
    APIs that differed from what you'd have written from memory (old → new,
    with file:line in the package), deprecated calls you replaced, and anything

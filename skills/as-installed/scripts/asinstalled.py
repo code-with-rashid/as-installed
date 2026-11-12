@@ -11,7 +11,8 @@
   check FILE...
              check every third-party import (and namespace member) in the
              given Python / JavaScript / TypeScript files against the
-             installed packages: missing modules, missing names, deprecated.
+             installed packages: missing modules, missing names, deprecated;
+             plus members used on what imported functions/classes return.
 
 Ecosystems: npm/pnpm/yarn/bun, Python (pip, uv, poetry, venvs), and
 versions/where for Go modules and Cargo. Standard library only. Python 3.8+.
@@ -235,6 +236,73 @@ def deprecated(obj):
         if m:
             return m.group(0).strip()[:160]
     return None
+def returned_members(m, callee, members):
+    """What calling m.<callee>(...) returns (the class itself, or the function's return
+    annotation if it is a class), and whether each member exists on it."""
+    import re, typing
+    obj = m
+    try:
+        for part in callee.split("."):
+            obj = getattr(obj, part)
+    except Exception:
+        return {"type": None, "why": "can't resolve %s" % callee}
+    target = obj if inspect.isclass(obj) else None
+    if target is None and callable(obj):
+        try:
+            hint = typing.get_type_hints(obj).get("return")
+        except Exception:
+            hint = getattr(obj, "__annotations__", {}).get("return")
+        if typing.get_origin(hint) in (getattr(typing, "Awaitable", None), getattr(typing, "Coroutine", None)):
+            hint = None
+        if inspect.isclass(hint):
+            target = hint
+    if inspect.iscoroutinefunction(obj):
+        target = None
+    if target is None:
+        return {"type": None, "why": "%s has no class return annotation" % callee}
+    out = {"type": "%s.%s" % (target.__module__, target.__qualname__), "members": {}}
+    mro = [c for c in inspect.getmro(target) if c is not object]
+    dyn = any("__getattr__" in vars(c) or "__getattribute__" in vars(c) for c in mro)
+    srcs, unreadable = [], False
+    for c in mro:
+        try:
+            srcs.append(inspect.getsource(c))
+        except Exception:
+            unreadable = True
+    for name in members:
+        try:
+            attr = inspect.getattr_static(target, name)
+        except AttributeError:
+            attr = None
+            found = False
+        else:
+            found = True
+        if found:
+            fn = attr.fget if isinstance(attr, property) else getattr(attr, "__func__", attr)
+            fn = getattr(fn, "func", fn)  # functools.cached_property
+            info = {"exists": True}
+            d = deprecated(fn) if (inspect.isfunction(fn) or inspect.isclass(fn)) else None
+            if d:
+                info["deprecated"] = d
+            try:
+                info["where"] = "%s:%s" % (inspect.getsourcefile(fn), inspect.getsourcelines(fn)[1])
+            except Exception:
+                pass
+            out["members"][name] = info
+            continue
+        declared = any(name in getattr(c, "__annotations__", {}) for c in mro) or \
+            name in (getattr(target, "__dataclass_fields__", None) or {}) or \
+            name in (getattr(target, "model_fields", None) or {}) or \
+            name in (getattr(target, "__fields__", None) or {}) or \
+            any(name in (getattr(c, "__slots__", ()) or ()) for c in mro) or \
+            any(re.search(r"\bself\.%s\s*(?::[^=\n]+)?=(?!=)" % re.escape(name), s) for s in srcs)
+        if declared:
+            out["members"][name] = {"exists": True}
+        elif dyn or unreadable:
+            out["members"][name] = {"exists": None}
+        else:
+            out["members"][name] = {"exists": False}
+    return out
 res = []
 for item in req.get("checks", []):
     mod, names, attrs = item["module"], item.get("names", []), item.get("attrs", [])
@@ -281,6 +349,9 @@ for item in req.get("checks", []):
             r["names"][n] = resolve(m, n)
         for a in attrs:
             r["attrs"][a] = resolve(m, a)
+        r["returns"] = {}
+        for callee, members in (item.get("returns") or {}).items():
+            r["returns"][callee] = returned_members(m, callee, members)
     res.append(r)
 out["checks"] = res
 if req.get("spec"):
@@ -526,23 +597,37 @@ DECL_RE = re.compile(
     r"(?:function\*?|const|let|var|class|interface|type|enum|namespace|module)\s+([A-Za-z_$][\w$]*)", re.S)
 EXPORT_LIST_RE = re.compile(r"export\s+(?:type\s+)?\{([^}]*)\}\s*(?:from\s*['\"]([^'\"]+)['\"])?", re.S)
 EXPORT_STAR_RE = re.compile(r"export\s+\*\s+(?:as\s+([\w$]+)\s+)?from\s*['\"]([^'\"]+)['\"]")
-LOCAL_DECL_RE = r"(?:/\*\*((?:(?!\*/).)*)\*/\s*)?(?:export\s+)?(?:declare\s+)?(?:function|const|let|var|class|interface|type|enum|namespace)\s+%s\b"
+LOCAL_DECL_RE = r"(?m)^[ \t]*(?:export\s+)?(?:declare\s+)?(?:abstract\s+)?(?:async\s+)?(?:function\*?|const|let|var|class|interface|type|enum|namespace)\s+%s(?![\w$])"
 
 
 def resolve_rel(base_file, spec):
     d = os.path.dirname(base_file)
     stem = os.path.normpath(os.path.join(d, spec))
     stem2 = re.sub(r"\.(m|c)?js$", "", stem)
-    for c in (stem, stem2 + ".d.ts", stem2 + ".d.mts", stem2 + ".d.cts", stem + ".d.ts",
-              os.path.join(stem, "index.d.ts"), stem2 + ".ts"):
-        if os.path.isfile(c):
+    # declaration files first: `./client.js` usually exists next to the `client.d.ts` we want
+    ext = {".mjs": ".d.mts", ".cjs": ".d.cts"}.get(os.path.splitext(stem)[1], ".d.ts")
+    for c in (stem2 + ext, stem2 + ".d.ts", stem2 + ".d.mts", stem2 + ".d.cts", stem + ".d.ts",
+              os.path.join(stem, "index.d.ts"), stem if stem.endswith((".d.ts", ".d.mts", ".d.cts")) else None,
+              stem2 + ".ts", stem):
+        if c and os.path.isfile(c):
             return c
     return None
 
 
+_DTS_CACHE = {}
+
+
 def dts_exports(path, root, seen=None):
     """name -> {"file", "line", "deprecated"} for everything a .d.ts file exports."""
-    seen = seen if seen is not None else set()
+    if seen is None and path in _DTS_CACHE:
+        return _DTS_CACHE[path]
+    if seen is None:
+        _DTS_CACHE[path] = out = _dts_exports(path, root, set())
+        return out
+    return _dts_exports(path, root, seen)
+
+
+def _dts_exports(path, root, seen):
     if not path or path in seen:
         return {}
     seen.add(path)
@@ -578,9 +663,10 @@ def dts_exports(path, root, seen=None):
                 else:
                     out.setdefault(alias, {"file": path, "line": text.count("\n", 0, m.start()) + 1, "deprecated": None})
             else:
-                lm = re.search(LOCAL_DECL_RE % re.escape(orig), text, re.S)
+                lm = re.search(LOCAL_DECL_RE % re.escape(orig), text)
                 if lm:
-                    add(alias, lm.start(), lm.group(1))
+                    doc = jsdoc_before(text, lm.start())
+                    add(alias, lm.start(), doc[3:] if doc else None)
                 else:
                     out.setdefault(alias, {"file": path, "line": text.count("\n", 0, m.start()) + 1, "deprecated": None})
     for m in EXPORT_STAR_RE.finditer(text):
@@ -899,6 +985,496 @@ def check_js(path, root, results):
                 results.append(finding(path, line, spec, version, "missing-name",
                                        "%s is not exported by %s@%s%s" % (n, name, version, " (%s)" % spec if sub else ""),
                                        where=tfile))
+    check_js_returned(path, text, root, results)
+
+
+# ------------------------------------------------------------------ check: members of returned objects (JS/TS)
+#
+# `const r = await streamText(...); r.toX()` or `new Client().foo` or `streamText(...).toX()`:
+# resolve the declared return type of the imported function (or the class) in the package's
+# .d.ts files, then check each member used on the result against that type.
+
+def blank_comments(text):
+    """Same-length copy of text with comments and string contents replaced by spaces."""
+    out = list(text)
+    i, n = 0, len(text)
+    while i < n:
+        c = text[i]
+        if text.startswith("/*", i):
+            j = text.find("*/", i + 2)
+            j = n if j < 0 else j + 2
+        elif text.startswith("//", i):
+            j = text.find("\n", i)
+            j = n if j < 0 else j
+        elif c in "'\"`":
+            j = i + 1
+            while j < n and text[j] != c and not (c != "`" and text[j] == "\n"):
+                j += 2 if text[j] == "\\" else 1
+            for k in range(i + 1, min(j, n)):
+                if out[k] != "\n":
+                    out[k] = " "
+            i = j + 1
+            continue
+        else:
+            i += 1
+            continue
+        for k in range(i, j):
+            if out[k] != "\n":
+                out[k] = " "
+        i = j
+    return "".join(out)
+
+
+def match_close(text, i, open_ch="(", close_ch=")"):
+    """Index of the bracket closing the one at text[i] (text should be comment-blanked)."""
+    depth = 0
+    for k in range(i, len(text)):
+        if text[k] == open_ch:
+            depth += 1
+        elif text[k] == close_ch:
+            depth -= 1
+            if depth == 0:
+                return k
+    return -1
+
+
+def match_angle(text, i):
+    """Index of the '>' closing the '<' at text[i] ('=>' doesn't count); len(text) if unclosed."""
+    depth = 0
+    for k in range(i, len(text)):
+        if text[k] == "<":
+            depth += 1
+        elif text[k] == ">" and text[k - 1] != "=":
+            depth -= 1
+            if depth == 0:
+                return k
+    return len(text)
+
+
+def strip_generics(s):
+    prev = None
+    while prev != s:
+        prev = s
+        s = re.sub(r"<[^<>]*>", "", s.replace("=>", "->"))
+    return s
+
+
+def jsdoc_before(text, pos):
+    before = text[:pos].rstrip()
+    if before.endswith("*/"):
+        start = before.rfind("/**")
+        if start >= 0:
+            return before[start:]
+    return ""
+
+
+def deprecation_of(doc):
+    if doc and "@deprecated" in doc:
+        m = re.search(r"@deprecated\b(.*?)(?=\n\s*\*\s*@|\*/|$)", doc, re.S)
+        msg = re.sub(r"\s*\n\s*\*?\s*", " ", m.group(1)).strip() if m else ""
+        return msg[:240] or "deprecated"
+    return None
+
+
+MEMBER_RE = re.compile(
+    r"(?:^|[;{,\n])\s*(?:(?:readonly|static|get|set|abstract|public|protected|private|declare|async|override)\s+)*"
+    r"(\[|['\"]?[A-Za-z_$][\w$]*['\"]?)\s*(\??)\s*([(:<]|;|$)", re.M)
+
+
+def body_members(text, start, end):
+    """{name: [deprecation-or-None, ...]} for the top-level members of the body text[start:end];
+    '[' in the result marks an index signature (any member name allowed)."""
+    clean = blank_comments(text[start:end])
+    depth, top = 0, []
+    for ch in clean:
+        top.append(ch if depth == 0 else " ")
+        if ch in "({[":
+            depth += 1
+        elif ch in ")}]":
+            depth -= 1
+    flat = "".join(top)
+    out = {}
+    for m in MEMBER_RE.finditer(flat):
+        name = m.group(1).strip("'\"")
+        if name == "[" and not re.match(r"\s*\[\s*[\w$]+\s*:", clean[m.start(1):]):
+            continue  # computed key like [Symbol.iterator], not an index signature
+        if name in ("constructor", "new"):
+            continue
+        out.setdefault(name, []).append(deprecation_of(jsdoc_before(text, start + m.start(1))))
+    return out
+
+
+class DtsIndex:
+    """Type declarations (interface/class/type) across a package's .d.ts files, loaded lazily."""
+
+    def __init__(self, root):
+        self.root = root
+        self.pkgs = {}
+
+    def files(self, pkg_dir):
+        if pkg_dir not in self.pkgs:
+            fs = []
+            for dp, dn, names in os.walk(pkg_dir):
+                dn[:] = [d for d in dn if d != "node_modules"]
+                fs += [os.path.join(dp, f) for f in names if f.endswith((".d.ts", ".d.mts", ".d.cts"))]
+            self.pkgs[pkg_dir] = fs
+        return self.pkgs[pkg_dir]
+
+    def decls(self, name, pkg_dir, ctx_file=None, depth=0):
+        """[(file, kind, text, header_start, body_start, body_end)] for type `name`."""
+        out = []
+        pat = re.compile(r"(?:^|[\s;])(?:export\s+)?(?:declare\s+)?(?:abstract\s+)?(interface|class|type)\s+%s\b" % re.escape(name))
+        for f in ([ctx_file] if ctx_file else []) + [x for x in self.files(pkg_dir) if x != ctx_file]:
+            text = read(f) or ""
+            if name not in text:
+                continue
+            clean = blank_comments(text)
+            for m in pat.finditer(clean):
+                kind = m.group(1)
+                if kind == "type":
+                    k = m.end()
+                    while k < len(clean) and clean[k] in " \t\r\n":
+                        k += 1
+                    if k < len(clean) and clean[k] == "<":
+                        k = match_angle(clean, k) + 1
+                        while k < len(clean) and clean[k] in " \t\r\n":
+                            k += 1
+                    if k >= len(clean) or clean[k] != "=":
+                        continue  # `type X` in an export list, not a declaration
+                    eq = k
+                    end = eq
+                    d = 0
+                    for k in range(eq + 1, len(clean)):
+                        ch = clean[k]
+                        if ch in "({[<":
+                            d += 1
+                        elif ch in ")}]>" and clean[k - 1] != "=":
+                            d -= 1
+                        elif ch == ";" and d <= 0:
+                            end = k
+                            break
+                    else:
+                        end = len(clean)
+                    out.append((f, kind, text, m.start(1), eq + 1, end))
+                else:
+                    ob = clean.find("{", m.end())
+                    cb = match_close(clean, ob, "{", "}") if ob >= 0 else -1
+                    if cb > 0:
+                        out.append((f, kind, text, m.start(1), ob, cb))
+            if out:
+                break
+        if not out and ctx_file and depth < 3:
+            # imported from another package: import { X as name } from 'pkg'
+            text = read(ctx_file) or ""
+            for m in re.finditer(r"import\s+(?:type\s+)?\{([^}]*)\}\s*from\s*['\"]([^'\"]+)['\"]", text):
+                for item in m.group(1).split(","):
+                    parts = re.split(r"\s+as\s+", re.sub(r"^\s*type\s+", "", item.strip()))
+                    if parts[-1].strip() == name:
+                        spec = m.group(2)
+                        if spec.startswith("."):
+                            target = resolve_rel(ctx_file, spec)
+                            return self.decls(parts[0].strip(), pkg_dir, target, depth + 1) if target else []
+                        d2 = node_pkg_dir(os.path.dirname(ctx_file), split_specifier(spec)[0])
+                        if d2:
+                            t = node_types_file(d2, split_specifier(spec)[1], self.root)
+                            return self.decls(parts[0].strip(), d2, t, depth + 1)
+        return out
+
+    def members(self, name, pkg_dir, ctx_file=None, seen=None):
+        """({member: [deprecations]}, complete, where) for type `name`; complete=False if part of the
+        type couldn't be resolved, so a member missing from the result might still exist."""
+        seen = seen if seen is not None else set()
+        if (name, pkg_dir) in seen:
+            return {}, True, None
+        seen.add((name, pkg_dir))
+        decls = self.decls(name, pkg_dir, ctx_file)
+        if not decls:
+            return {}, False, None
+        out, complete = {}, True
+        where = "%s:%d" % (decls[0][0], decls[0][2].count("\n", 0, decls[0][3]) + 1)
+
+        def merge(res):
+            nonlocal complete
+            m, c, _ = res
+            for k, v in m.items():
+                out.setdefault(k, []).extend(v)
+            complete = complete and c
+
+        for f, kind, text, hs, bs, be in decls:
+            clean = blank_comments(text)
+            if kind == "type":
+                merge(self.type_expr_members(clean[bs:be], text, bs, pkg_dir, f, seen))
+                continue
+            header = strip_generics(clean[hs:bs])
+            em = re.search(r"\bextends\s+(.*?)(?:\bimplements\b|$)", header, re.S)
+            if em:
+                for base in em.group(1).split(","):
+                    base = base.strip()
+                    if re.match(r"^[A-Za-z_$][\w$]*$", base):
+                        merge(self.members(base, pkg_dir, f, seen))
+                    elif base:
+                        complete = False
+            merge((body_members(text, bs + 1, be), True, None))
+        if "[" in out:
+            complete = False
+        return out, complete, where
+
+    def pick_omit(self, which, targs, pkg_dir, ctx_file, seen):
+        """Members of Pick<T, 'a' | 'b'> / Omit<T, 'a' | 'b'> when T is a named type and keys are literals."""
+        clean = blank_comments(targs)
+        depth, cut = 0, -1
+        for k, ch in enumerate(clean):
+            if ch in "<({[":
+                depth += 1
+            elif ch in ")}]" or (ch == ">" and clean[k - 1] != "="):
+                depth -= 1
+            elif ch == "," and depth == 0:
+                cut = k
+                break
+        if cut < 0:
+            return {}, False
+        base = re.match(r"^\s*([A-Za-z_$][\w$]*)\s*(?:<.*>)?\s*$", targs[:cut], re.S)
+        keys_txt = targs[cut + 1:].strip()
+        if not base or not re.match(r"""^(?:\s*\|?\s*(?:'[^']*'|"[^"]*"))+\s*$""", keys_txt):
+            return {}, False
+        keys = set(re.findall(r"['\"]([^'\"]*)['\"]", keys_txt))
+        ms, c, _ = self.members(base.group(1), pkg_dir, ctx_file, set(seen))
+        if which == "Pick":
+            # Pick's keys must exist on T, so they exist even where T itself didn't fully resolve
+            return {k: ms.get(k, [None]) for k in keys}, True
+        return {k: v for k, v in ms.items() if k not in keys}, c
+
+    def type_expr_members(self, expr, text, offset, pkg_dir, ctx_file, seen):
+        out, complete = {}, True
+        flat = strip_generics(expr)
+        if "|" in flat or "=>" in expr or "->" in flat:
+            complete = False
+        i = 0
+        while i < len(expr):
+            ch = expr[i]
+            if ch == "{":
+                cb = match_close(expr, i, "{", "}")
+                if cb < 0:
+                    break
+                for k, v in body_members(text, offset + i + 1, offset + cb).items():
+                    out.setdefault(k, []).extend(v)
+                i = cb + 1
+                continue
+            m = re.match(r"[A-Za-z_$][\w$.]*", expr[i:])
+            if m and (i == 0 or not re.match(r"[\w$.]", expr[i - 1])):
+                ident = m.group(0)
+                j = i + len(ident)
+                rest = expr[j:].lstrip()
+                targs = None
+                if rest.startswith("<"):  # type arguments
+                    k = expr.index("<", j)
+                    e = match_angle(expr, k)
+                    targs = text[offset + k + 1:offset + e]  # original text: keeps string literals
+                    j = e + 1
+                if ident in ("Pick", "Omit") and targs:
+                    sub, c = self.pick_omit(ident, targs, pkg_dir, ctx_file, seen)
+                    for k2, v in sub.items():
+                        out.setdefault(k2, []).extend(v)
+                    complete = complete and c
+                elif ident in ("Partial", "Required", "Readonly") and targs and re.match(r"^\s*[A-Za-z_$][\w$]*\s*(?:<.*>)?\s*$", targs, re.S):
+                    sub, c, _ = self.members(re.match(r"\s*([\w$]+)", targs).group(1), pkg_dir, ctx_file, seen)
+                    for k2, v in sub.items():
+                        out.setdefault(k2, []).extend(v)
+                    complete = complete and c
+                elif ident in ("Omit", "Pick", "Partial", "Required", "Readonly", "ReturnType", "Awaited") or "." in ident:
+                    complete = False
+                elif ident not in ("typeof", "keyof", "infer", "extends"):
+                    sub, c, _ = self.members(ident, pkg_dir, ctx_file, seen)
+                    for k2, v in sub.items():
+                        out.setdefault(k2, []).extend(v)
+                    complete = complete and c
+                i = j
+                continue
+            i += 1
+        return out, complete, None
+
+
+def return_types(text, fname, awaited):
+    """Type names function `fname` returns (all overloads declared in text).
+    None if the return type isn't a plain (generic) type reference."""
+    clean = blank_comments(text)
+    names = []
+    for m in re.finditer(r"(?:declare\s+)?function\s+%s(?![\w$])\s*" % re.escape(fname), clean):
+        k = m.end()
+        if k < len(clean) and clean[k] == "<":
+            k = match_angle(clean, k) + 1
+        k = clean.find("(", k)
+        close = match_close(clean, k) if k >= 0 else -1
+        rm = re.match(r"\s*:\s*([^;{]+)", clean[close + 1:]) if close > 0 else None
+        if not rm:
+            return None
+        rt = strip_generics(rm.group(1)).strip()
+        pm = re.match(r"^(?:Promise|PromiseLike)\s*$", rt)
+        full = rm.group(1).strip()
+        if pm or full.startswith(("Promise<", "PromiseLike<")):
+            if not awaited:
+                return []  # a promise; its members are Promise's
+            inner = full[full.index("<") + 1:full.rindex(">")]
+            rt = strip_generics(inner).strip()
+        if not re.match(r"^[A-Za-z_$][\w$]*$", rt):
+            return None
+        names.append(rt)
+    return names or None
+
+
+def default_export_name(path):
+    """(declared name, file declaring it) behind a .d.ts file's default export, or (None, None)."""
+    text = blank_comments(read(path) or "")
+    raw = read(path) or ""
+    m = re.search(r"export\s+default\s+(?:declare\s+)?(?:abstract\s+)?(?:class|function|interface)?\s*([A-Za-z_$][\w$]*)", text)
+    if m and m.group(1) not in ("class", "function", "interface"):
+        return m.group(1), path
+    m = re.search(r"export\s*=\s*([A-Za-z_$][\w$]*)", text)
+    if m:
+        return m.group(1), path
+    for m in EXPORT_LIST_RE.finditer(raw):
+        for item in m.group(1).split(","):
+            parts = re.split(r"\s+as\s+", re.sub(r"^\s*type\s+", "", item.strip()))
+            if len(parts) == 2 and parts[1].strip() == "default":
+                src = m.group(2)
+                target = resolve_rel(path, src) if src and src.startswith(".") else path
+                return parts[0].strip(), target or path
+    return None, None
+
+
+CALL_SITE_RE = re.compile(r"(?<![\w$.])(new\s+)?([A-Za-z_$][\w$]*)((?:\s*\.\s*[A-Za-z_$][\w$]*)*)\s*(?:<[^<>()]*>)?\s*\(")
+JS_GLOBAL_MEMBERS = {"then", "catch", "finally", "constructor", "toString", "valueOf", "hasOwnProperty"}
+
+
+def js_bindings(text):
+    """{local name: (specifier, exported name or '*')} for imports in a JS/TS file."""
+    clean = blank_comments(text)
+    out = {}
+    for m in re.finditer(r"""import\s+(?:type\s+)?([\w$*\s{},]*?)\s*from\s*(['"])([^'"]+)\2""", text):
+        if clean[m.start()] != "i":
+            continue
+        clause, spec = m.group(1), m.group(3)
+        br = re.search(r"\{([^}]*)\}", clause)
+        if br:
+            for item in br.group(1).split(","):
+                item = re.sub(r"^\s*type\s+", "", item.strip())
+                if item:
+                    parts = re.split(r"\s+as\s+", item)
+                    out[parts[-1].strip()] = (spec, parts[0].strip())
+        nsm = re.search(r"\*\s*as\s+([\w$]+)", clause)
+        if nsm:
+            out[nsm.group(1)] = (spec, "*")
+        rest = re.sub(r"\{[^}]*\}|\*\s*as\s+[\w$]+|\*", "", clause).strip(" ,")
+        if rest and re.match(r"^[\w$]+$", rest):
+            out[rest] = (spec, "default")
+    for m in re.finditer(r"""(?:const|let|var)\s+(\{[^}]*\}|[\w$]+)\s*=\s*require\(\s*['"]([^'"]+)['"]\s*\)""", text):
+        target, spec = m.group(1), m.group(2)
+        if target.startswith("{"):
+            for item in target.strip("{} ").split(","):
+                parts = re.split(r"\s*:\s*", item.strip())
+                if parts[0]:
+                    out[parts[-1].strip()] = (spec, parts[0].strip())
+        else:
+            out[target] = (spec, "*")
+    return out
+
+
+def check_js_returned(path, text, root, results, index=None):
+    bindings = {k: v for k, v in js_bindings(text).items() if is_bare(v[0], root)}
+    if not bindings:
+        return
+    index = index or DtsIndex(root)
+    clean = blank_comments(text)
+    sites = []  # (local var or None, callee label, spec, export name, is_new, awaited, line, direct member)
+    for m in CALL_SITE_RE.finditer(clean):
+        local = m.group(2)
+        if local not in bindings:
+            continue
+        spec, exported = bindings[local]
+        chain = [c for c in re.split(r"\s*\.\s*", m.group(3).strip()) if c]
+        if exported == "*" and len(chain) == 1:
+            exported = chain[0]
+        elif exported == "*" or chain:
+            continue  # a method on an object: return type not resolvable here
+        is_new = bool(m.group(1))
+        open_paren = m.end() - 1
+        close = match_close(clean, open_paren)
+        if close < 0:
+            continue
+        before = clean[:m.start()]
+        vm = re.search(r"(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*(?::[^=;]+)?=\s*(await\s+)?$", before)
+        dm = re.match(r"\s*\.\s*([A-Za-z_$][\w$]*)", clean[close + 1:])
+        line = clean.count("\n", 0, m.start()) + 1
+        awaited = bool(vm and vm.group(2))
+        if vm:
+            sites.append((vm.group(1), local, spec, exported, is_new, awaited, line, None))
+        elif dm and not re.search(r"await\s*$", before):
+            sites.append((None, local, spec, exported, is_new, False, line, (dm.group(1), clean.count("\n", 0, close) + 1)))
+    for var, callee, spec, exported, is_new, awaited, line, direct in sites:
+        uses = []
+        if direct:
+            uses.append(direct)
+        else:
+            for um in re.finditer(r"(?<![\w$.])%s\s*\??\.\s*([A-Za-z_$][\w$]*)" % re.escape(var), clean):
+                uses.append((um.group(1), clean.count("\n", 0, um.start()) + 1))
+        uses = [(u, ln) for u, ln in uses if u not in JS_GLOBAL_MEMBERS]
+        if not uses:
+            continue
+        name, sub = split_specifier(spec)
+        d = node_pkg_dir(root, name)
+        if not d:
+            continue
+        version = (load_json(os.path.join(d, "package.json")) or {}).get("version")
+        tfile = node_types_file(d, sub, root)
+        hit = dts_exports(tfile, root).get(exported) if tfile else None
+        label = "%s(...)" % callee if not is_new else "new %s(...)" % callee
+        types = None
+        if hit and exported == "default":
+            exported, deffile = default_export_name(tfile)
+            hit = {"file": deffile} if exported else None
+        if hit:
+            dtext = read(hit["file"]) or ""
+            if is_new:
+                types = [exported]
+            else:
+                types = return_types(dtext, exported, awaited)
+        if types == []:
+            continue
+        seen_use = set()
+        for member, uline in uses:
+            if member in seen_use:
+                continue
+            seen_use.add(member)
+            shown = "%s.%s" % (var or label, member)
+            if not types:
+                results.append(finding(path, uline, spec, version, "unverified",
+                                       "%s: can't resolve what %s returns in %s@%s; confirm %s with `find %s %s`"
+                                       % (shown, label, name, version, member, name, member)))
+                continue
+            decls, complete, where = {}, True, None
+            for t in types:
+                ms, c, w = index.members(t, d, hit["file"])
+                for k, v in ms.items():
+                    decls.setdefault(k, []).extend(v)
+                complete = complete and c
+                where = where or w
+            tname = " | ".join(types)
+            if member in decls:
+                deps = decls[member]
+                if all(deps):
+                    results.append(finding(path, uline, spec, version, "deprecated",
+                                           "%s is deprecated in %s@%s (on %s): %s" % (shown, name, version, tname, deps[0]),
+                                           where=where))
+                else:
+                    results.append(finding(path, uline, spec, version, "ok", "%s (on %s)" % (shown, tname)))
+            elif complete and decls:
+                results.append(finding(path, uline, spec, version, "missing-name",
+                                       "%s: %s in %s@%s has no member %s" % (shown, tname, name, version, member),
+                                       where=where))
+            else:
+                results.append(finding(path, uline, spec, version, "unverified",
+                                       "%s: %s isn't fully resolvable in %s@%s; confirm %s with `find %s %s`"
+                                       % (shown, tname, name, version, member, name, member), where=where))
 
 
 def tsconfig_alias(root, spec):
@@ -939,7 +1515,41 @@ def py_imports(path):
             if isinstance(cur, ast.Name) and cur.id in bound:
                 chain.reverse()
                 attrs.setdefault(cur.id, set()).add((".".join(chain), node.lineno))
-    return (imports, bound, attrs), None
+
+    def callee_of(call):
+        """(bound local, attribute chain) if call invokes something imported, else None."""
+        if isinstance(call, ast.Await):
+            call = call.value
+        if not isinstance(call, ast.Call):
+            return None
+        chain, cur = [], call.func
+        while isinstance(cur, ast.Attribute):
+            chain.append(cur.attr)
+            cur = cur.value
+        if isinstance(cur, ast.Name) and cur.id in bound:
+            return cur.id, ".".join(reversed(chain))
+        return None
+
+    returned = {}  # (local, chain) -> set((member, line))
+    assigned = {}  # variable -> (local, chain); variables assigned more than once are dropped
+    for node in ast.walk(tree):
+        targets = node.targets if isinstance(node, ast.Assign) else [node.target] if isinstance(node, ast.AnnAssign) and node.value else []
+        for t in targets:
+            if isinstance(t, ast.Name):
+                c = callee_of(node.value)
+                assigned[t.id] = c if t.id not in assigned else None
+        if isinstance(node, (ast.With, ast.AsyncWith)):
+            for it in node.items:  # `with Client() as c` is __enter__'s result: don't guess
+                if isinstance(it.optional_vars, ast.Name):
+                    assigned[it.optional_vars.id] = None
+        if isinstance(node, ast.Attribute) and isinstance(node.value, ast.Call):
+            c = callee_of(node.value)
+            if c:
+                returned.setdefault(c, set()).add((node.attr, node.lineno))
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name) and assigned.get(node.value.id):
+            returned.setdefault(assigned[node.value.id], set()).add((node.attr, node.lineno))
+    return (imports, bound, attrs, returned), None
 
 
 def local_module(root, top, path):
@@ -966,8 +1576,8 @@ def check_py(paths, root, results):
     stdlib = set(probe.get("stdlib") or [])
     pkgdist = probe.get("pkgdist") or {}
     dists = probe.get("dists") or {}
-    checks, owners = {}, {}
-    for p, (imports, bound, attrs) in parsed.items():
+    checks, owners, ret_owners = {}, {}, {}
+    for p, (imports, bound, attrs, returned) in parsed.items():
         for mod, names, line in imports:
             top = mod.split(".")[0]
             if top in stdlib or top == "__future__" or local_module(root, top, p):
@@ -986,9 +1596,21 @@ def check_py(paths, root, results):
                 full = obj + "." + chain if obj else chain
                 c["attrs"].add(full)
                 owners.setdefault(mod, []).append((p, line, ["." + full]))
+        for (local, chain), uses in returned.items():
+            mod, _, obj = bound[local].partition(":")
+            top = mod.split(".")[0]
+            callee = ".".join(x for x in (obj, chain) if x)
+            if not callee or top in stdlib or top == "__future__" or local_module(root, top, p):
+                continue
+            c = checks.setdefault(mod, {"module": mod, "names": set(), "attrs": set()})
+            for member, line in uses:
+                c.setdefault("returns", {}).setdefault(callee, set()).add(member)
+                ret_owners.setdefault(mod, []).append((p, line, callee, member))
     if not checks:
         return
-    req = {"checks": [{"module": k, "names": sorted(v["names"]), "attrs": sorted(v["attrs"])} for k, v in checks.items()]}
+    req = {"checks": [{"module": k, "names": sorted(v["names"]), "attrs": sorted(v["attrs"]),
+                       "returns": {ck: sorted(cv) for ck, cv in v.get("returns", {}).items()}}
+                      for k, v in checks.items()]}
     res = run_py_helper(root, req)
     if "error" in res:
         results.append(finding(paths[0], 0, None, None, "unverified", res["error"]))
@@ -1019,6 +1641,28 @@ def check_py(paths, root, results):
                                            "%s is deprecated in %s: %s" % (shown, label, info["deprecated"]), where=info.get("where")))
                 else:
                     results.append(finding(p, line, mod, version, "ok", shown))
+        if not r.get("ok"):
+            continue
+        for p, line, callee, member in ret_owners.get(mod, []):
+            rt = (r.get("returns") or {}).get(callee) or {}
+            shown = "%s(...).%s" % (callee, member)
+            if not rt.get("type"):
+                results.append(finding(p, line, mod, version, "unverified",
+                                       "%s: %s; confirm %s with `find %s %s`" % (shown, rt.get("why", "return type unknown"),
+                                                                                 member, dist, member)))
+                continue
+            info = (rt.get("members") or {}).get(member) or {}
+            if info.get("exists") is False:
+                results.append(finding(p, line, mod, version, "missing-name",
+                                       "%s: %s (%s) has no attribute %s" % (shown, rt["type"], label, member)))
+            elif info.get("exists") is None:
+                results.append(finding(p, line, mod, version, "unverified",
+                                       "%s: %s is dynamic or compiled; confirm %s with `find %s %s`" % (shown, rt["type"], member, dist, member)))
+            elif info.get("deprecated"):
+                results.append(finding(p, line, mod, version, "deprecated",
+                                       "%s is deprecated in %s: %s" % (shown, label, info["deprecated"]), where=info.get("where")))
+            else:
+                results.append(finding(p, line, mod, version, "ok", "%s (on %s)" % (shown, rt["type"])))
 
 
 def finding(path, line, spec, version, status, detail, where=None):

@@ -1,5 +1,28 @@
 # Changelog
 
+## 0.2.0 — 2026-11-12
+
+- `check` now verifies members used on objects returned by imported calls
+  ([#1](https://github.com/code-with-rashid/as-installed/issues/1)). With AI
+  SDK 7, `const result = streamText(...); result.toUIMessageStreamResponse()`
+  used to pass; it is now reported as deprecated, with the replacement from
+  the package's own deprecation note.
+  - JS/TS: `const x = [await] fn(...)`, `fn(...).member` and `new Class(...)`
+    for imported functions and classes (named, namespace and default imports).
+    The declared return type is resolved in the package's `.d.ts` files,
+    following `extends`, intersections, `Pick`/`Omit`, `Partial`, declaration
+    merging, `Promise<T>` when awaited, and types imported from other packages.
+  - Python: `x = Class(...)` and functions whose return annotation is a class.
+    Methods, properties, class attributes, annotations, dataclass and pydantic
+    fields, `__slots__` and `self.x = ...` assignments count as members.
+  - Results are `ok`, `deprecated`, `missing-name` (only when the whole type
+    resolved), or `unverified` with a `find` hint when it didn't.
+- Deprecation notes that span several JSDoc lines are now shown in full.
+- Re-exports such as `export { X } from "./client.js"` now resolve to
+  `client.d.ts` (or `.d.mts`) rather than the JavaScript file next to it.
+- `check` on large bundled `.d.ts` files (AI SDK: 12k lines) went from about
+  30 s to 2 s.
+
 ## 0.1.1 — 2026-11-03
 
 - `find` (Python): a `@deprecated` decorator or deprecation warning on the next

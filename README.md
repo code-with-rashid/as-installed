@@ -37,6 +37,9 @@ The code you have on disk is the exact version that will run.
 - **Proves it afterwards.** A dependency-free checker resolves every
   third-party import, imported name, and module/namespace member in the changed
   files against the installed packages, and flags missing and deprecated ones.
+  It also follows the objects those calls return (`const result = streamText(...)`,
+  `new OpenAI()`, `client = Client()`) and checks the members used on them
+  against the declared return type.
   The agent fixes them and re-runs until clean, then runs your typecheck/tests.
 - **Fixes the code, not your dependencies.** It never bumps or pins versions
   to make its code work, and never edits installed packages.
@@ -53,16 +56,19 @@ npm    zod         declared ^4.6.7     locked 4.6.7     installed 4.6.7
 pypi   mcp         declared >=2        locked -         installed 2.3.0
 
 $ python asinstalled.py check server.py route.ts
-checked 9 import(s)/name(s) in 2 file(s): 6 ok, 3 problem(s)
+checked 11 import(s)/name(s) in 2 file(s): 7 ok, 4 problem(s)
 route.ts:1  missing-name    notAThing is not exported by ai@7.0.162
     see node_modules\ai\dist\index.d.ts
 route.ts:1  missing-name    experimental_bogus is not exported by ai@7.0.162
+route.ts:9  deprecated      result.toUIMessageStreamResponse is deprecated in ai@7.0.162 (on StreamTextResult):
+    Use the standalone `toUIMessageStream` and `createUIMessageStreamResponse` helpers from `'ai'`
+    with `result.stream` instead. This method will be removed in the next major release.
 server.py:1  missing-module  can't import mcp.server.fastmcp (mcp 2.3.0): ModuleNotFoundError:
     No module named 'mcp.server.fastmcp'. This is mcp 2.x, where FastMCP was renamed to MCPServer
     (from mcp.server.mcpserver import MCPServer) ...
 
 $ python asinstalled.py find ai toUIMessageStreamResponse
-node_modules\ai\dist\index.d.ts:3003  [DEPRECATED: Use the standalone `toUIMessageStream` and]
+node_modules\ai\dist\index.d.ts:3003  [DEPRECATED: Use the standalone `toUIMessageStream` and ...]
     toUIMessageStreamResponse<UI_MESSAGE extends UIMessage>(options?: ...): Response;
 ```
 
@@ -145,11 +151,16 @@ Poetry's.
 ## Limitations
 
 - `check` covers JavaScript/TypeScript and Python. It resolves imports, imported
-  names, and members of imported modules, namespaces and classes. It can't
-  follow methods on objects returned at runtime (`client.chat.create()`); the
-  skill has the agent confirm those with `find`, and your typecheck catches the
-  rest. For Go and Rust it reports versions and source locations; the compiler
-  (`go build`, `cargo check`) does the verification.
+  names, members of imported modules, namespaces and classes, and one level of
+  members on what an imported function or class returns: `const r = await
+  fn(...)`, `fn(...).member`, `new Class()`, and in Python `Class()` or a
+  function with a class return annotation. It goes no deeper
+  (`client.chat.completions.create` checks `chat` only), and doesn't follow
+  values passed between functions or destructured. Where the return type can't
+  be resolved it reports `unverified` rather than guessing; the skill has the
+  agent confirm those with `find`, and your typecheck catches the rest. For Go
+  and Rust it reports versions and source locations; the compiler (`go build`,
+  `cargo check`) does the verification.
 - Python checks import the packages with the project's interpreter, which runs
   their import-time code. Use it on environments you trust.
 - Yarn Plug'n'Play (no `node_modules`) isn't supported.

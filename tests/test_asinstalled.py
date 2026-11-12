@@ -205,6 +205,57 @@ class CheckJsTest(TempRepo):
         self.assertEqual([o["detail"] for o in res["ok"]], ["alpha"])
         self.assertEqual([p["detail"].split()[0] for p in res["problems"]], ["gamma"])
 
+    def test_members_of_returned_objects(self):
+        extra = {
+            "node_modules/tidewater/dist/stream.d.ts": (
+                "import { Pool } from './pool';\n"
+                "interface Base { close(): void; }\n"
+                "interface StreamResult<T> extends Base {\n  readonly text: Promise<string>;\n"
+                "  /**\n   * @deprecated Use `toStream` with\n   * `respond()` instead.\n   */\n"
+                "  toResponse(init?: { status: number }): Response;\n  toStream(): ReadableStream<T>;\n}\n"
+                "type Lite = Pick<StreamResult<string>, 'text' | 'close'>;\n"
+                "type Loose = StreamResult<string> | Record<string, unknown>;\n"
+                "declare function stream<T = string>(opts: { onChunk?: (c: T) => void }): StreamResult<T>;\n"
+                "declare function liteStream(): Lite;\n"
+                "declare function looseStream(): Loose;\n"
+                "declare function fetchIt(): Promise<StreamResult<string>>;\n"
+                "declare function weird(): { a: 1 }['a'];\n"
+                "export { stream, liteStream, looseStream, fetchIt, weird, type StreamResult };\n"),
+            "node_modules/tidewater/dist/index.d.ts": (
+                "export * from './pool';\nexport * from './stream';\nexport declare const VERSION: string;\n"
+                "/** @deprecated use openPool */\nexport declare function legacyConnect(): void;\n"),
+            "package.json": json.dumps({"dependencies": {"tidewater": "^3.0.0"}}),
+            "src/use.ts": (
+                "import { openPool, stream, liteStream, looseStream, fetchIt, weird } from 'tidewater';\n"
+                "import * as tw from 'tidewater';\n"
+                "const pool = openPool('db://x');\npool.run('select 1');\npool.query('x');\npool.nope();\n"
+                "const s = stream({ onChunk: (c) => { } });\ns.toStream(); s.close(); s.toResponse(); s.text;\n"
+                "s.bogus;\n"
+                "openPool('y').gone();\n"
+                "const l = liteStream(); l.text; l.toStream();\n"
+                "const z = looseStream(); z.whatever;\n"
+                "async function f() { const r = await fetchIt(); r.toStream(); r.zap; }\n"
+                "const p = fetchIt(); p.then(() => 1);\n"
+                "const w = weird(); w.a;\n"
+                "const n = tw.openPool('z'); n.missingToo();\n"
+                "// pool.commented();\nconst str = 'pool.inString()';\n")}
+        write(self.root, dict(TIDEWATER, **extra))
+        res, code = run(["check", os.path.join(self.root, "src"), "--root", self.root])
+        self.assertEqual(code, 1)
+        probs = {(p["status"], p["detail"].split(":")[0].split(" ")[0]) for p in res["problems"]}
+        expected = {
+            ("deprecated", "pool.query"), ("missing-name", "pool.nope"),
+            ("deprecated", "s.toResponse"), ("missing-name", "s.bogus"),
+            ("missing-name", "openPool(...).gone"), ("missing-name", "l.toStream"),
+            ("unverified", "z.whatever"), ("missing-name", "r.zap"), ("unverified", "w.a"),
+            ("missing-name", "n.missingToo"),
+        }
+        self.assertEqual(probs, expected)
+        dep = [p for p in res["problems"] if p["detail"].startswith("s.toResponse")][0]
+        self.assertIn("Use `toStream` with `respond()` instead.", dep["detail"])
+        oks = {o["detail"].split(" ")[0] for o in res["ok"]}
+        self.assertTrue({"pool.run", "s.toStream", "s.close", "s.text", "l.text", "r.toStream"} <= oks, oks)
+
     def test_tsconfig_alias_is_not_a_package(self):
         write(self.root, {"tsconfig.json": '{\n  // comment\n  "compilerOptions": {"paths": {"$lib/*": ["src/lib/*"]},},\n}',
                           "x.ts": "import { a } from '$lib/a';\n"})
@@ -253,6 +304,44 @@ class CheckPyTest(TempRepo):
         self.assertNotIn("os", statuses)
         oks = {o["detail"] for o in res["ok"]}
         self.assertTrue({"fakepy.Client", "fakepy.connect", "fakepy.Client.send", "fakepy.server.app.App"} <= oks, oks)
+
+    def test_members_of_returned_objects(self):
+        self.site(dict(FAKEPY, **{
+            "fakepy/client.py": (
+                "import dataclasses\n"
+                "@dataclasses.dataclass\nclass Result:\n    status: int\n    def json(self):\n        pass\n"
+                "class Base:\n    def close(self):\n        pass\n"
+                "class Client(Base):\n    retries = 3\n"
+                "    def __init__(self):\n        self.timeout = 5\n"
+                "    def send(self) -> Result:\n        return Result(200)\n"
+                "    def post(self):\n        '''Post.\n\n        Deprecated: use send().\n        '''\n"
+                "    @property\n    def url(self):\n        return ''\n"
+                "class Dyn:\n    def __getattr__(self, n):\n        return 1\n"
+                "def make() -> Result:\n    return Result(1)\n"
+                "def untyped():\n    return Result(1)\n"),
+            "fakepy/__init__.py": "from .client import Client, Dyn, Result, make, untyped\n"}))
+        write(self.root, {"app.py": (
+            "import fakepy\nfrom fakepy import Client, Dyn, make, untyped\n"
+            "c = Client()\nc.send(); c.post(); c.timeout; c.retries; c.url; c.close(); c.nosuch()\n"
+            "r = make()\nr.status; r.json(); r.text\n"
+            "Client().gone\n"
+            "d = Dyn(); d.anything\n"
+            "u = untyped(); u.whatever\n"
+            "k = fakepy.Client(); k.vanished\n"
+            "x = Client()\nx = 3\nx.real\n"
+            "with Client() as cm:\n    cm.ctx\n")})
+        res, code = run(["check", os.path.join(self.root, "app.py"), "--root", self.root])
+        self.assertEqual(code, 1)
+        probs = {(p["status"], p["detail"].split(":")[0].split(" ")[0]) for p in res["problems"]}
+        self.assertEqual(probs, {
+            ("deprecated", "Client(...).post"), ("missing-name", "Client(...).nosuch"),
+            ("missing-name", "make(...).text"), ("missing-name", "Client(...).gone"),
+            ("unverified", "Dyn(...).anything"), ("unverified", "untyped(...).whatever"),
+            ("missing-name", "Client(...).vanished"),
+        })
+        oks = {o["detail"].split(" ")[0] for o in res["ok"]}
+        self.assertTrue({"Client(...).send", "Client(...).timeout", "Client(...).retries", "Client(...).url",
+                         "Client(...).close", "make(...).status", "make(...).json"} <= oks, oks)
 
     def test_syntax_error_reported(self):
         write(self.root, {"bad.py": "def (:\n"})

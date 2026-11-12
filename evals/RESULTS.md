@@ -60,3 +60,19 @@ tsconfig path aliases, and (0.1.1) a decorator on the next definition not leakin
 Real-package smoke test: on `ai@7.0.162` and `mcp` 2.3.0, `check` flagged the
 removed `mcp.server.fastmcp` import and made-up exports, and `find` marked
 `toUIMessageStreamResponse` deprecated with the replacement named in its note.
+
+## 0.2.0 — 2026-11-12: members of returned objects (issue #1)
+
+Checked against real packages in a scratch project (Windows 11, Python 3.14, Node 24):
+`ai@7.0.170`, `@ai-sdk/openai`, `openai@7.55.0`, and Python `click 8.5.0`.
+
+- Reported case: `const result = streamText(...); return result.toUIMessageStreamResponse()`
+  was clean in 0.1.1; 0.2.0 reports it `deprecated` with the package's note (use `toUIMessageStream` +
+  `createUIMessageStreamResponse` with `result.stream`). `streamText(...).toDataStreamResponse()` (the
+  v4 name) and an invented `r.notAThing` on `generateText` are `missing-name`.
+- False-positive sweep: 46 real members across `new OpenAI()`, `streamText`, `generateText`,
+  `embedMany` results: 0 wrong `missing-name`. 3 `deprecated` (all real JSDoc `@deprecated`),
+  3 `unverified` (`ReadableStream` from lib.dom, and `Agent`, which didn't fully resolve).
+- `click.Context(...).made_up` → `missing-name`; `find_root()` ok.
+- Unit tests: 20 (2 new, covering inheritance, Pick, unions, awaited promises, default exports,
+  comments/strings, reassigned variables, `with ... as`, dataclass/property/`self.x` members).
